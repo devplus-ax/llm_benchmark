@@ -3,11 +3,19 @@ Interactive HTML Report Generator for consolidated LLM benchmark and security ev
 Self-contained, responsive dashboard with SVG visualizations, filterable test cases, and metric scorecards.
 """
 
+import html
 import json
 from pathlib import Path
 from typing import Any, Dict
 
 from llm_eval.utils import SafeJSONEncoder, log_success
+
+
+def escape_html(val: Any) -> str:
+    """Safely escape values for HTML, gracefully handling None or non-strings."""
+    if val is None:
+        return ""
+    return html.escape(str(val))
 
 
 def generate_html_report(report_data: Dict[str, Any], output_path: Path) -> Path:
@@ -90,10 +98,10 @@ def generate_html_report(report_data: Dict[str, Any], output_path: Path) -> Path
                 reasons_html += f"<li>{r}</li>"
             reasons_html += "</ul></div>"
 
-        # Escape HTML in prompts and responses
-        prompt_esc = tc.get("prompt", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        resp_esc = tc.get("response_text", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        exp_esc = tc.get("expected_behavior", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        # Escape HTML in prompts and responses safely
+        prompt_esc = escape_html(tc.get("prompt"))
+        resp_esc = escape_html(tc.get("response_text"))
+        exp_esc = escape_html(tc.get("expected_behavior"))
 
         owasp_cards_html += f"""
         <div class="test-card" data-status="{status}" data-severity="{sev}" data-category="{tc.get('category', '')}">
@@ -101,10 +109,10 @@ def generate_html_report(report_data: Dict[str, Any], output_path: Path) -> Path
                 <div style="display: flex; align-items: center; gap: 10px;">
                     <span class="badge {badge_cls}">{status}</span>
                     <span class="badge {sev_cls}">{sev}</span>
-                    <strong>{tc.get('test_id')}</strong>: {tc.get('title')}
+                    <strong>{escape_html(tc.get('test_id'))}</strong>: {escape_html(tc.get('title'))}
                 </div>
                 <div style="display: flex; align-items: center; gap: 15px; font-size: 13px; color: #94a3b8;">
-                    <span>{tc.get('category')}</span>
+                    <span>{escape_html(tc.get('category'))}</span>
                     <span>{tc.get('latency_ms', 0)} ms</span>
                     <span class="toggle-icon">▼</span>
                 </div>
@@ -128,8 +136,8 @@ def generate_html_report(report_data: Dict[str, Any], output_path: Path) -> Path
         status = r.get("status", "BLOCKED")
         bypassed = r.get("bypassed", False)
         badge_cls = "badge-fail" if bypassed else "badge-pass"
-        goal_esc = r.get("goal", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        resp_esc = r.get("response_text", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        goal_esc = escape_html(r.get("goal"))
+        resp_esc = escape_html(r.get("response_text"))
         adv_rows_html += f"""
         <tr>
             <td style="white-space: nowrap;"><strong>{r.get('id')}</strong></td>
