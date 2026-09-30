@@ -1,0 +1,3 @@
+# Core dependencies for high-concurrency async benchmark and YAML parsing
+aiohttp>=3.9.0
+pyyaml>=6.0

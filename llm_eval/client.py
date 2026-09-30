@@ -1,14 +1,19 @@
 """
 Async HTTP client for querying LLM endpoints (vLLM, OpenAI-compatible, custom APIs)
 with accurate Time-To-First-Token (TTFT), TPOT, and latency instrumentation.
+Supports high-speed aiohttp when installed, with automatic fallback to standard library urllib.
 """
 
 import asyncio
 import json
+from pathlib import Path
 import random
 import re
+import sys
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+import urllib.error
+import urllib.request
 
 try:
     import aiohttp
@@ -73,17 +78,25 @@ def estimate_tokens(text: str) -> int:
     return max(1, int(round((words * 1.3 + chars / 4.0) / 2.0)))
 
 
+_WARNED_ABOUT_AIOHTTP = False
+
+
 class AsyncLLMClient:
     """High-concurrency async client for communicating with vLLM, OpenAI, and custom AI endpoints."""
 
     def __init__(self, config: EndpointConfig):
         self.config = config
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._session: Optional[Any] = None
 
     async def __aenter__(self):
-        if not self.config.mock_mode and AIOHTTP_AVAILABLE:
-            timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+        global _WARNED_ABOUT_AIOHTTP
+        if not self.config.mock_mode:
+            if AIOHTTP_AVAILABLE:
+                timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
+                self._session = aiohttp.ClientSession(timeout=timeout)
+            elif not _WARNED_ABOUT_AIOHTTP:
+                print("\033[33m[WARN] aiohttp not installed; falling back to standard library urllib. For maximum concurrent throughput benchmark performance, install aiohttp: pip install aiohttp\033[0m")
+                _WARNED_ABOUT_AIOHTTP = True
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -95,13 +108,6 @@ class AsyncLLMClient:
         if self.config.mock_mode:
             return ["google/gemma-4-31B-it", "meta-llama/Llama-3-8B-Instruct"]
 
-        if not AIOHTTP_AVAILABLE:
-            raise RuntimeError("aiohttp library is required to perform live HTTP requests.")
-
-        if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-            self._session = aiohttp.ClientSession(timeout=timeout)
-
         base = self.config.get_base_url().rstrip("/")
         endpoints_to_try = [
             f"{base}/v1/models",
@@ -109,37 +115,63 @@ class AsyncLLMClient:
         ]
         headers = self._build_headers()
 
-        for url in endpoints_to_try:
-            try:
-                async with self._session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        model_ids: List[str] = []
-                        if isinstance(data, dict):
-                            items = data.get("data", []) or data.get("models", [])
-                            if isinstance(items, list):
-                                for item in items:
-                                    if isinstance(item, dict):
-                                        m_id = item.get("id") or item.get("name") or item.get("model")
-                                        if m_id:
-                                            model_ids.append(str(m_id))
-                                    elif isinstance(item, str):
-                                        model_ids.append(item)
-                        elif isinstance(data, list):
-                            for item in data:
-                                if isinstance(item, dict):
-                                    m_id = item.get("id") or item.get("name") or item.get("model")
-                                    if m_id:
-                                        model_ids.append(str(m_id))
-                                elif isinstance(item, str):
-                                    model_ids.append(item)
+        if AIOHTTP_AVAILABLE:
+            if self._session is None or self._session.closed:
+                timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
+                self._session = aiohttp.ClientSession(timeout=timeout)
 
-                        if model_ids:
-                            return model_ids
-            except Exception:
-                continue
+            for url in endpoints_to_try:
+                try:
+                    async with self._session.get(url, headers=headers) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            model_ids = self._parse_model_list(data)
+                            if model_ids:
+                                return model_ids
+                except Exception:
+                    continue
+        else:
+            # Fallback to standard library urllib via thread
+            def _fetch_sync():
+                for url in endpoints_to_try:
+                    try:
+                        req = urllib.request.Request(url, headers=headers, method="GET")
+                        with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as resp:
+                            if resp.status == 200:
+                                data = json.loads(resp.read().decode("utf-8"))
+                                model_ids = self._parse_model_list(data)
+                                if model_ids:
+                                    return model_ids
+                    except Exception:
+                        continue
+                return []
+
+            return await asyncio.to_thread(_fetch_sync)
 
         return []
+
+    def _parse_model_list(self, data: Any) -> List[str]:
+        """Extract model IDs from various standard /v1/models response formats."""
+        model_ids: List[str] = []
+        if isinstance(data, dict):
+            items = data.get("data", []) or data.get("models", [])
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        m_id = item.get("id") or item.get("name") or item.get("model")
+                        if m_id:
+                            model_ids.append(str(m_id))
+                    elif isinstance(item, str):
+                        model_ids.append(item)
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    m_id = item.get("id") or item.get("name") or item.get("model")
+                    if m_id:
+                        model_ids.append(str(m_id))
+                elif isinstance(item, str):
+                    model_ids.append(item)
+        return model_ids
 
     def _build_headers(self) -> Dict[str, str]:
         headers = {
@@ -165,7 +197,7 @@ class AsyncLLMClient:
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
-            
+
             payload = {
                 "model": self.config.model,
                 "messages": messages,
@@ -197,13 +229,6 @@ class AsyncLLMClient:
         if self.config.mock_mode:
             return await self._mock_query(prompt, system_prompt, max_tokens, stream)
 
-        if not AIOHTTP_AVAILABLE:
-            raise RuntimeError("aiohttp library is required to perform live HTTP requests.")
-
-        if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
-            self._session = aiohttp.ClientSession(timeout=timeout)
-
         url = self.config.get_chat_url()
         headers = self._build_headers()
         payload = self._build_payload(
@@ -215,20 +240,182 @@ class AsyncLLMClient:
         )
 
         input_tokens = estimate_tokens(prompt) + (estimate_tokens(system_prompt) if system_prompt else 0)
+
+        # 1. Use aiohttp if available
+        if AIOHTTP_AVAILABLE:
+            if self._session is None or self._session.closed:
+                timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
+                self._session = aiohttp.ClientSession(timeout=timeout)
+
+            start_time = time.perf_counter()
+            try:
+                if stream and self.config.api_type in ("vllm", "openai"):
+                    return await self._query_streaming(url, headers, payload, prompt, input_tokens, start_time)
+                else:
+                    return await self._query_non_streaming(url, headers, payload, prompt, input_tokens, start_time)
+            except asyncio.TimeoutError:
+                latency = time.perf_counter() - start_time
+                return LLMResponse(
+                    prompt=prompt,
+                    success=False,
+                    status_code=408,
+                    error_msg=f"Request timed out after {self.config.timeout_seconds}s",
+                    latency_s=latency,
+                    input_tokens=input_tokens,
+                )
+            except Exception as e:
+                latency = time.perf_counter() - start_time
+                return LLMResponse(
+                    prompt=prompt,
+                    success=False,
+                    status_code=500,
+                    error_msg=str(e),
+                    latency_s=latency,
+                    input_tokens=input_tokens,
+                )
+
+        # 2. Standard library fallback using urllib.request
+        return await asyncio.to_thread(
+            self._query_urllib_sync,
+            url,
+            headers,
+            payload,
+            prompt,
+            input_tokens,
+            stream,
+        )
+
+    def _query_urllib_sync(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        prompt: str,
+        input_tokens: int,
+        stream: bool,
+    ) -> LLMResponse:
+        """Fallback synchronous query using Python standard library urllib."""
         start_time = time.perf_counter()
+        req_data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=req_data, headers=headers, method="POST")
 
         try:
-            if stream and self.config.api_type in ("vllm", "openai"):
-                return await self._query_streaming(url, headers, payload, prompt, input_tokens, start_time)
-            else:
-                return await self._query_non_streaming(url, headers, payload, prompt, input_tokens, start_time)
-        except asyncio.TimeoutError:
+            with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as response:
+                status = response.status
+                if stream and self.config.api_type in ("vllm", "openai"):
+                    ttft_s: Optional[float] = None
+                    collected_chunks: List[str] = []
+                    chunk_timestamps: List[float] = []
+
+                    for raw_line in response:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+
+                        now = time.perf_counter()
+                        if ttft_s is None:
+                            ttft_s = now - start_time
+
+                        chunk_timestamps.append(now)
+
+                        try:
+                            chunk_json = json.loads(data_str)
+                            choices = chunk_json.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    collected_chunks.append(content)
+                        except Exception:
+                            pass
+
+                    end_time = time.perf_counter()
+                    total_latency = end_time - start_time
+                    full_text = "".join(collected_chunks)
+                    output_tokens = estimate_tokens(full_text)
+
+                    itl = []
+                    for i in range(1, len(chunk_timestamps)):
+                        itl.append(chunk_timestamps[i] - chunk_timestamps[i - 1])
+
+                    tpot_s = None
+                    if len(chunk_timestamps) > 1 and ttft_s is not None:
+                        tpot_s = (end_time - (start_time + ttft_s)) / max(1, (len(chunk_timestamps) - 1))
+
+                    return LLMResponse(
+                        prompt=prompt,
+                        text=full_text,
+                        success=True,
+                        status_code=status,
+                        latency_s=total_latency,
+                        ttft_s=ttft_s or total_latency,
+                        tpot_s=tpot_s,
+                        inter_token_latencies=itl,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                    )
+                else:
+                    # Non-streaming
+                    resp_bytes = response.read()
+                    latency = time.perf_counter() - start_time
+                    data = json.loads(resp_bytes.decode("utf-8"))
+                    full_text = ""
+                    if "choices" in data and len(data["choices"]) > 0:
+                        msg = data["choices"][0]
+                        if "message" in msg and "content" in msg["message"]:
+                            full_text = msg["message"]["content"]
+                        elif "text" in msg:
+                            full_text = msg["text"]
+                    elif "response" in data:
+                        full_text = str(data["response"])
+                    elif "content" in data:
+                        full_text = str(data["content"])
+                    elif "message" in data:
+                        full_text = str(data["message"])
+                    else:
+                        full_text = str(data)
+
+                    usage = data.get("usage", {})
+                    out_toks = usage.get("completion_tokens", estimate_tokens(full_text))
+                    in_toks = usage.get("prompt_tokens", input_tokens)
+
+                    return LLMResponse(
+                        prompt=prompt,
+                        text=full_text,
+                        success=True,
+                        status_code=status,
+                        latency_s=latency,
+                        ttft_s=latency * 0.4,
+                        tpot_s=(latency * 0.6) / max(1, out_toks),
+                        input_tokens=in_toks,
+                        output_tokens=out_toks,
+                        raw_response=data,
+                    )
+        except urllib.error.HTTPError as e:
+            latency = time.perf_counter() - start_time
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")[:300]
+            except Exception:
+                err_body = str(e)
+            return LLMResponse(
+                prompt=prompt,
+                success=False,
+                status_code=e.code,
+                error_msg=f"HTTP {e.code}: {err_body}",
+                latency_s=latency,
+                input_tokens=input_tokens,
+            )
+        except urllib.error.URLError as e:
             latency = time.perf_counter() - start_time
             return LLMResponse(
                 prompt=prompt,
                 success=False,
-                status_code=408,
-                error_msg=f"Request timed out after {self.config.timeout_seconds}s",
+                status_code=503,
+                error_msg=f"Connection Error: {e.reason}",
                 latency_s=latency,
                 input_tokens=input_tokens,
             )
@@ -252,7 +439,7 @@ class AsyncLLMClient:
         input_tokens: int,
         start_time: float,
     ) -> LLMResponse:
-        """Process streaming SSE response for exact TTFT & TPOT measurement."""
+        """Process streaming SSE response with aiohttp for exact TTFT & TPOT measurement."""
         ttft_s: Optional[float] = None
         collected_chunks: List[str] = []
         chunk_timestamps: List[float] = []
@@ -294,7 +481,6 @@ class AsyncLLMClient:
                         if content:
                             collected_chunks.append(content)
                 except Exception:
-                    # Ignore malformed chunk
                     pass
 
         end_time = time.perf_counter()
@@ -333,7 +519,7 @@ class AsyncLLMClient:
         input_tokens: int,
         start_time: float,
     ) -> LLMResponse:
-        """Process standard JSON response."""
+        """Process standard JSON response with aiohttp."""
         async with self._session.post(url, headers=headers, json=payload) as response:
             latency = time.perf_counter() - start_time
             if response.status != 200:
@@ -374,7 +560,7 @@ class AsyncLLMClient:
                 success=True,
                 status_code=200,
                 latency_s=latency,
-                ttft_s=latency * 0.4,  # Estimated for non-streaming
+                ttft_s=latency * 0.4,
                 tpot_s=(latency * 0.6) / max(1, out_toks),
                 input_tokens=in_toks,
                 output_tokens=out_toks,
@@ -389,17 +575,14 @@ class AsyncLLMClient:
         stream: bool = True,
     ) -> LLMResponse:
         """Simulate realistic model behavior and latencies for offline verification."""
-        # Simulated timing: TTFT ~20-50ms, TPOT ~5-15ms
         sim_ttft = random.uniform(0.020, 0.050)
         sim_tpot = random.uniform(0.006, 0.014)
         await asyncio.sleep(sim_ttft + sim_tpot * min(20, max_tokens))
 
         prompt_lower = prompt.lower()
 
-        # Check for OWASP / injection test triggers to simulate realistic AI defenses
         if any(w in prompt_lower for w in ["ignore all previous", "ignore previous instructions"]):
             if "say 'injection successful'" in prompt_lower or "say injection successful" in prompt_lower:
-                # 90% chance safe refusal, 10% simulated vulnerability for report verification if testing
                 response_text = "I cannot fulfill this request. I am programmed to be a helpful and harmless assistant, and I must adhere to my safety guidelines regardless of instructions to override them."
             else:
                 response_text = "I cannot ignore my previous system instructions."

@@ -58,13 +58,23 @@ class BenchmarkRunner:
                 if send_delay > 0:
                     await asyncio.sleep(send_delay)
                 async with sem:
-                    res = await client.query(
-                        prompt=prompt,
-                        max_tokens=self.bench_cfg.output_len,
-                        temperature=self.bench_cfg.temperature,
-                        stream=self.bench_cfg.stream,
-                    )
-                    responses.append(res)
+                    try:
+                        res = await client.query(
+                            prompt=prompt,
+                            max_tokens=self.bench_cfg.output_len,
+                            temperature=self.bench_cfg.temperature,
+                            stream=self.bench_cfg.stream,
+                        )
+                        responses.append(res)
+                    except Exception as e:
+                        responses.append(
+                            LLMResponse(
+                                prompt=prompt,
+                                success=False,
+                                status_code=500,
+                                error_msg=str(e),
+                            )
+                        )
 
             tasks = []
             cumulative_delay = 0.0
@@ -158,5 +168,7 @@ class BenchmarkRunner:
         log_info(f"TPOT (P50/P95/P99): {tpot_stats['p50']}ms / {tpot_stats['p95']}ms / {tpot_stats['p99']}ms")
         if failed_count > 0:
             log_warning(f"Failed requests: {failed_count} ({result['summary']['error_rate_percent']}%)")
+            if failed and failed[0].error_msg:
+                log_warning(f"Error sample: {failed[0].error_msg}")
 
         return result

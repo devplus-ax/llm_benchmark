@@ -182,7 +182,38 @@ async def run_single_model(cfg: SuiteConfig) -> Dict[str, Any]:
     }
 
 
+def ensure_submodules_initialized():
+    """Check if submodules (OWASP and AdvBench) have files; if not, auto-initialize them."""
+    owasp_test = Path("owasp-llm-security-community-tests/tests/LLM01_prompt_injection.md")
+    advbench_test = Path("llm-attacks/data/advbench/harmful_behaviors.csv")
+
+    if not owasp_test.is_file() or not advbench_test.is_file():
+        if Path(".gitmodules").is_file():
+            log_info("Submodule test files missing or empty. Attempting auto-initialization via git...")
+            try:
+                import subprocess
+                res = subprocess.run(
+                    ["git", "submodule", "update", "--init", "--recursive"],
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                )
+                if res.returncode == 0:
+                    log_success("Git submodules initialized successfully!")
+                else:
+                    log_warning(f"Git submodule update failed:\n{res.stderr.strip()}")
+            except Exception as e:
+                log_warning(
+                    f"Could not auto-initialize submodules: {e}\n"
+                    "Please run manually in this directory: git submodule update --init --recursive"
+                )
+
+
 async def main_async(cfg: SuiteConfig):
+    # Ensure security submodules are present if security suites are enabled
+    if cfg.owasp.enabled or cfg.llm_attacks.enabled:
+        ensure_submodules_initialized()
+
     # Check if auto model discovery is requested
     target_models: List[str] = []
 
