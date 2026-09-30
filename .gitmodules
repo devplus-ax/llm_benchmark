@@ -1,0 +1,9 @@
+[submodule "vllm"]
+	path = vllm
+	url = https://github.com/vllm-project/vllm.git
+[submodule "llm-attacks"]
+	path = llm-attacks
+	url = https://github.com/llm-attacks/llm-attacks.git
+[submodule "owasp-llm-security-community-tests"]
+	path = owasp-llm-security-community-tests
+	url = https://github.com/testmy-ai/owasp-llm-security-community-tests.git

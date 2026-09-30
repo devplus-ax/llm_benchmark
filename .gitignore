@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Generated test run artifacts
+reports/*.json
+reports/*.html
+!reports/.gitkeep
+
+# Environment & local settings
+.env
+venv/
+.venv/
+env/
+
+# Editor configurations
+.vscode/
+.idea/
+*.swp
+*.bak
